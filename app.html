@@ -1,0 +1,1166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="Tasks"/>
+  <meta name="theme-color" content="#6366f1"/>
+  <title>Tasks & Notes</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <style>
+    *{-webkit-tap-highlight-color:transparent;box-sizing:border-box}
+    html,body,#root{height:100%;margin:0;padding:0;overflow:hidden}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f0f4ff}
+    .scrollable{overflow-y:auto;-webkit-overflow-scrolling:touch}
+    .no-sb::-webkit-scrollbar{display:none}
+    .no-sb{-ms-overflow-style:none;scrollbar-width:none}
+    .line-clamp-3{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+    @keyframes spin{to{transform:rotate(360deg)}}
+    .spin{animation:spin 1s linear infinite}
+  </style>
+  <script>
+    tailwind.config = {
+      theme: { extend: { colors: { primary: { 50:'#f0f4ff',100:'#e0e9ff',500:'#4f6ef7',600:'#3d5ae8',700:'#2d47d4' } } } }
+    }
+  </script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useCallback, createContext, useContext, useRef } = React;
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+function newId(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,6) }
+function now(){ return new Date().toISOString() }
+function fmtDate(iso){
+  if(!iso) return ''
+  try{ return new Date(iso).toLocaleString('en-GB',{day:'2-digit',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'}) }
+  catch{ return iso }
+}
+
+// ─── Google API ──────────────────────────────────────────────────────────────
+let _token = null
+const setToken = t => _token = t
+const getToken = () => _token
+
+async function sheetsGet(id,range){
+  const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(range)}`,
+    {headers:{Authorization:`Bearer ${_token}`}})
+  if(!r.ok) throw new Error(`Sheets error ${r.status}`)
+  return r.json()
+}
+async function sheetsAppend(id,range,values){
+  const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    {method:'POST',headers:{Authorization:`Bearer ${_token}`,'Content-Type':'application/json'},body:JSON.stringify({values})})
+  if(!r.ok) throw new Error(`Sheets append error ${r.status}`)
+  return r.json()
+}
+async function sheetsUpdate(id,range,values){
+  const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`,
+    {method:'PUT',headers:{Authorization:`Bearer ${_token}`,'Content-Type':'application/json'},body:JSON.stringify({values})})
+  if(!r.ok) throw new Error(`Sheets update error ${r.status}`)
+  return r.json()
+}
+async function ensureSheet(id,name){
+  const meta = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}?fields=sheets.properties.title`,
+    {headers:{Authorization:`Bearer ${_token}`}}).then(r=>r.json())
+  if(meta.sheets?.some(s=>s.properties.title===name)) return
+  await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`,
+    {method:'POST',headers:{Authorization:`Bearer ${_token}`,'Content-Type':'application/json'},
+     body:JSON.stringify({requests:[{addSheet:{properties:{title:name}}}]})})
+}
+async function initSheets(id){
+  await ensureSheet(id,'Tasks')
+  await ensureSheet(id,'Notes')
+  const t = await sheetsGet(id,'Tasks!A1:I1')
+  if(!t.values?.length) await sheetsAppend(id,'Tasks!A1',[['id','text','status','createdAt','modifiedAt','doneAt','attachments','subTasks','folder']])
+  const n = await sheetsGet(id,'Notes!A1:H1')
+  if(!n.values?.length) await sheetsAppend(id,'Notes!A1',[['id','title','project','body','status','createdAt','modifiedAt','attachments']])
+}
+
+// Tasks CRUD  (column I = folder)
+function rowToTask(r){ if(!r||!r[0])return null; return {id:r[0],text:r[1]||'',status:r[2]||'active',createdAt:r[3]||'',modifiedAt:r[4]||'',doneAt:r[5]||'',attachments:r[6]?JSON.parse(r[6]):[],subTasks:r[7]?JSON.parse(r[7]):[],folder:r[8]||'Personal'} }
+function taskToRow(t){ return [t.id,t.text,t.status,t.createdAt,t.modifiedAt,t.doneAt||'',JSON.stringify(t.attachments||[]),JSON.stringify(t.subTasks||[]),t.folder||'Personal'] }
+async function getTasks(id){ const r=await sheetsGet(id,'Tasks!A:I'); return (r.values||[]).slice(1).map(rowToTask).filter(Boolean) }
+async function addTask(id,text,folder='Personal'){ const t={id:newId(),text,status:'active',createdAt:now(),modifiedAt:now(),doneAt:'',attachments:[],subTasks:[],folder}; await sheetsAppend(id,'Tasks!A:I',[taskToRow(t)]); return t }
+async function findTaskRow(id,tid){ const r=await sheetsGet(id,'Tasks!A:I'); const rows=r.values||[]; for(let i=1;i<rows.length;i++) if(rows[i][0]===tid) return i+1; return null }
+async function updateTask(id,task){ task.modifiedAt=now(); const row=await findTaskRow(id,task.id); if(!row) throw new Error('Not found'); await sheetsUpdate(id,`Tasks!A${row}:I${row}`,[taskToRow(task)]); return task }
+async function deleteTask(id,tid){ const row=await findTaskRow(id,tid); if(!row) return; const r=await sheetsGet(id,`Tasks!A${row}:I${row}`); const t=rowToTask((r.values||[[]])[0]); if(t){t.status='deleted';t.modifiedAt=now();await sheetsUpdate(id,`Tasks!A${row}:I${row}`,[taskToRow(t)])} }
+
+// Notes CRUD
+function rowToNote(r){ if(!r||!r[0])return null; return {id:r[0],title:r[1]||'',project:r[2]||'',body:r[3]||'',status:r[4]||'active',createdAt:r[5]||'',modifiedAt:r[6]||'',attachments:r[7]?JSON.parse(r[7]):[]} }
+function noteToRow(n){ return [n.id,n.title,n.project||'',n.body,n.status,n.createdAt,n.modifiedAt,JSON.stringify(n.attachments||[])] }
+async function getNotes(id){ const r=await sheetsGet(id,'Notes!A:H'); return (r.values||[]).slice(1).map(rowToNote).filter(Boolean) }
+async function addNote(id,{title,project,body}){ const n={id:newId(),title,project:project||'',body,status:'active',createdAt:now(),modifiedAt:now(),attachments:[]}; await sheetsAppend(id,'Notes!A:H',[noteToRow(n)]); return n }
+async function findNoteRow(id,nid){ const r=await sheetsGet(id,'Notes!A:H'); const rows=r.values||[]; for(let i=1;i<rows.length;i++) if(rows[i][0]===nid) return i+1; return null }
+async function updateNote(id,note){ note.modifiedAt=now(); const row=await findNoteRow(id,note.id); if(!row) throw new Error('Not found'); await sheetsUpdate(id,`Notes!A${row}:H${row}`,[noteToRow(note)]); return note }
+async function deleteNote(id,nid){ const row=await findNoteRow(id,nid); if(!row) return; const r=await sheetsGet(id,`Notes!A${row}:H${row}`); const n=rowToNote((r.values||[[]])[0]); if(n){n.status='deleted';n.modifiedAt=now();await sheetsUpdate(id,`Notes!A${row}:H${row}`,[noteToRow(n)])} }
+
+// Drive
+async function getOrCreateFolder(name,parentId=null){
+  const q=parentId?`name='${name}' and mimeType='application/vnd.google-apps.folder' and '${parentId}' in parents and trashed=false`:`name='${name}' and mimeType='application/vnd.google-apps.folder' and trashed=false`
+  const r=await fetch(`https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=files(id,name)`,{headers:{Authorization:`Bearer ${_token}`}}).then(r=>r.json())
+  if(r.files?.length) return r.files[0].id
+  const body={name,mimeType:'application/vnd.google-apps.folder'}
+  if(parentId) body.parents=[parentId]
+  const c=await fetch('https://www.googleapis.com/drive/v3/files',{method:'POST',headers:{Authorization:`Bearer ${_token}`,'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json())
+  return c.id
+}
+async function uploadFile(file,folderId){
+  const meta={name:file.name,parents:[folderId]}
+  const form=new FormData()
+  form.append('metadata',new Blob([JSON.stringify(meta)],{type:'application/json'}))
+  form.append('file',file)
+  const r=await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,thumbnailLink',{method:'POST',headers:{Authorization:`Bearer ${_token}`},body:form})
+  if(!r.ok) throw new Error('Upload failed')
+  const d=await r.json()
+  await fetch(`https://www.googleapis.com/drive/v3/files/${d.id}/permissions`,{method:'POST',headers:{Authorization:`Bearer ${_token}`,'Content-Type':'application/json'},body:JSON.stringify({role:'reader',type:'anyone'})})
+  return d
+}
+async function addToCalendar({summary,description,dateTime}){
+  const start=new Date(dateTime), end=new Date(start.getTime()+3600000)
+  const r=await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events',{method:'POST',headers:{Authorization:`Bearer ${_token}`,'Content-Type':'application/json'},body:JSON.stringify({summary,description,start:{dateTime:start.toISOString()},end:{dateTime:end.toISOString()}})})
+  if(!r.ok) throw new Error('Calendar error')
+  return r.json()
+}
+
+// ─── Context ─────────────────────────────────────────────────────────────────
+const Ctx = createContext(null)
+function useApp(){ return useContext(Ctx) }
+
+const DEFAULT_SETTINGS = { spreadsheetId:'', driveFolderName:'TasksNotesApp', clientId:'' }
+
+function AppProvider({children}){
+  const [settings,setSettingsState]=useState(()=>{ try{return JSON.parse(localStorage.getItem('appSettings')||'null')||DEFAULT_SETTINGS}catch{return DEFAULT_SETTINGS} })
+  const [user,setUser]=useState(null)
+  const [tasks,setTasks]=useState([])
+  const [notes,setNotes]=useState([])
+  const [loading,setLoading]=useState(false)
+  const [syncing,setSyncing]=useState(false)
+  const [error,setError]=useState(null)
+
+  function saveSettings(s){ localStorage.setItem('appSettings',JSON.stringify(s)); setSettingsState(s) }
+
+  async function loadData(sid){
+    if(!sid) return
+    setLoading(true); setError(null)
+    try{
+      await initSheets(sid)
+      const [t,n]=await Promise.all([getTasks(sid),getNotes(sid)])
+      setTasks(t.filter(x=>x.status!=='deleted'))
+      setNotes(n.filter(x=>x.status!=='deleted'))
+    }catch(e){ setError(e.message) }
+    finally{ setLoading(false) }
+  }
+
+  async function handleSignIn(tokenResp,userInfo){
+    setToken(tokenResp.access_token); setUser(userInfo)
+    if(settings.spreadsheetId) await loadData(settings.spreadsheetId)
+  }
+  function handleSignOut(){ setToken(null); setUser(null); setTasks([]); setNotes([]) }
+
+  async function refreshData(){
+    if(!settings.spreadsheetId) return
+    setSyncing(true)
+    try{
+      const [t,n]=await Promise.all([getTasks(settings.spreadsheetId),getNotes(settings.spreadsheetId)])
+      setTasks(t.filter(x=>x.status!=='deleted'))
+      setNotes(n.filter(x=>x.status!=='deleted'))
+    }catch(e){ setError(e.message) }
+    finally{ setSyncing(false) }
+  }
+
+  return <Ctx.Provider value={{settings,saveSettings,user,tasks,setTasks,notes,setNotes,loading,syncing,error,handleSignIn,handleSignOut,refreshData,loadData}}>{children}</Ctx.Provider>
+}
+
+// ─── Icons (inline SVG) ───────────────────────────────────────────────────────
+const Icon = {
+  check: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>,
+  circle: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><circle cx="12" cy="12" r="10"/></svg>,
+  checkCircle: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>,
+  plus: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} strokeLinecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
+  x: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
+  edit: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
+  trash: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>,
+  archive: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>,
+  calendar: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>,
+  clip: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>,
+  copy: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>,
+  share: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>,
+  chevDown: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><polyline points="6 9 12 15 18 9"/></svg>,
+  chevUp: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><polyline points="18 15 12 9 6 15"/></svg>,
+  settings: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>,
+  sync: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>,
+  logout: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>,
+  ext: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>,
+  grip: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><circle cx="9" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="6" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="18" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="18" r="1" fill="currentColor" stroke="none"/></svg>,
+  task: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1" ry="1"/><line x1="9" y1="12" x2="15" y2="12"/><line x1="9" y1="16" x2="11" y2="16"/></svg>,
+  note: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round"><path d="M11 5H6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-5"/><path d="M17.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>,
+}
+
+function Ico({k,size=16,className=''}){
+  return <span className={`inline-flex items-center justify-center ${className}`} style={{width:size,height:size}}>{Icon[k]}</span>
+}
+
+// ─── Btn helper ───────────────────────────────────────────────────────────────
+function ActionBtn({ico,label,color='gray',onClick,disabled}){
+  const colors={gray:'text-gray-500 bg-gray-50 hover:bg-gray-100',blue:'text-blue-500 bg-blue-50 hover:bg-blue-100',red:'text-red-500 bg-red-50 hover:bg-red-100',green:'text-green-600 bg-green-50 hover:bg-green-100'}
+  return <button onClick={onClick} disabled={disabled} className={`flex items-center gap-1 text-xs rounded-lg px-2.5 py-1.5 font-medium active:opacity-70 ${colors[color]} disabled:opacity-40`}>
+    <Ico k={ico} size={13}/>{label}
+  </button>
+}
+
+// ─── Login Screen ─────────────────────────────────────────────────────────────
+function LoginScreen(){
+  const {settings,saveSettings,handleSignIn}=useApp()
+  const [err,setErr]=useState('')
+  const needsSetup=!settings.clientId||!settings.spreadsheetId
+  const [mode,setMode]=useState(needsSetup?'setup':'signin')
+  const [form,setForm]=useState({clientId:settings.clientId||'',spreadsheetId:settings.spreadsheetId||'',driveFolderName:settings.driveFolderName||'TasksNotesApp'})
+
+  function saveForm(){
+    if(!form.clientId.trim()||!form.spreadsheetId.trim()) return
+    saveSettings({...settings,...form})
+    setMode('signin')
+  }
+
+  function signIn(){
+    setErr('')
+    const cid=settings.clientId||form.clientId
+    if(!cid||!settings.spreadsheetId){setMode('setup');return}
+    const client=window.google?.accounts?.oauth2?.initTokenClient({
+      client_id:cid,
+      scope:'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email',
+      callback:async resp=>{
+        if(resp.error){setErr('Sign-in failed: '+resp.error);return}
+        const ui=await fetch('https://www.googleapis.com/oauth2/v3/userinfo',{headers:{Authorization:`Bearer ${resp.access_token}`}}).then(r=>r.json())
+        handleSignIn(resp,ui)
+      }
+    })
+    if(!client){setErr('Google sign-in not loaded yet — wait a moment and try again.');return}
+    client.requestAccessToken()
+  }
+
+  return <div className="flex flex-col h-full bg-gradient-to-br from-blue-50 to-indigo-100 overflow-y-auto scrollable">
+    <div className="flex flex-col items-center justify-center min-h-full px-6 py-10">
+      <div className="w-full max-w-sm">
+        <div className="flex flex-col items-center mb-8">
+          <div className="w-20 h-20 bg-indigo-500 rounded-3xl flex items-center justify-center shadow-lg mb-4">
+            <Ico k="task" size={40} className="text-white"/>
+          </div>
+          <h1 className="text-3xl font-bold text-gray-800">Tasks & Notes</h1>
+          <p className="text-gray-500 mt-1 text-sm">Powered by Google Sheets & Drive</p>
+        </div>
+
+        {mode==='setup'
+          ?<div className="bg-white rounded-2xl shadow-lg p-5 space-y-4">
+            <h2 className="text-lg font-bold text-gray-800">Connect your Google account</h2>
+            <div className="bg-indigo-50 rounded-xl p-3 text-xs text-indigo-800 space-y-1.5">
+              <p className="font-semibold">One-time setup:</p>
+              <p>1. <a href="https://console.cloud.google.com" target="_blank" rel="noopener noreferrer" className="underline">console.cloud.google.com</a> → Enable APIs: Sheets, Drive, Calendar</p>
+              <p>2. Credentials → OAuth 2.0 Client ID (Web app) → add <strong className="break-all">{window.location.origin}</strong> as Authorized JavaScript origin → copy Client ID</p>
+              <p>3. Open a blank <a href="https://sheets.google.com" target="_blank" rel="noopener noreferrer" className="underline">Google Sheet</a> and copy the ID from its URL</p>
+            </div>
+            {err&&<div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-700">{err}</div>}
+            <div className="space-y-1">
+              <label className="text-xs font-semibold text-gray-600 uppercase tracking-wide">OAuth Client ID</label>
+              <input value={form.clientId} onChange={e=>setForm({...form,clientId:e.target.value.trim()})}
+                placeholder="xxxx.apps.googleusercontent.com"
+                className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Google Sheet ID</label>
+              <p className="text-xs text-gray-400">From URL: /spreadsheets/d/<strong>[this part]</strong>/edit</p>
+              <input value={form.spreadsheetId} onChange={e=>setForm({...form,spreadsheetId:e.target.value.trim()})}
+                placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+                className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs font-semibold text-gray-600 uppercase tracking-wide">Drive Folder Name</label>
+              <input value={form.driveFolderName} onChange={e=>setForm({...form,driveFolderName:e.target.value})}
+                placeholder="TasksNotesApp"
+                className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"/>
+            </div>
+            <button onClick={saveForm} disabled={!form.clientId.trim()||!form.spreadsheetId.trim()}
+              className="w-full bg-indigo-500 text-white rounded-2xl py-3 font-semibold disabled:opacity-40 hover:bg-indigo-600 active:bg-indigo-700">
+              Save & Continue →
+            </button>
+          </div>
+
+          :<div className="bg-white rounded-2xl shadow-lg p-6 space-y-4">
+            <p className="text-sm text-gray-600 text-center">Sign in with your Google account to sync your data.</p>
+            {err&&<div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-700">{err}</div>}
+            <button onClick={signIn} className="w-full flex items-center justify-center gap-3 bg-white border-2 border-gray-200 rounded-xl py-3 px-4 text-gray-700 font-medium hover:bg-gray-50 active:bg-gray-100 shadow-sm">
+              <svg className="w-5 h-5" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+              Sign in with Google
+            </button>
+            <button onClick={()=>setMode('setup')} className="w-full text-sm text-indigo-500 font-medium py-1.5 hover:text-indigo-700">
+              ⚙️ Change credentials
+            </button>
+          </div>
+        }
+      </div>
+    </div>
+  </div>
+}
+
+// ─── Quick Setup ──────────────────────────────────────────────────────────────
+function QuickSetup({onBack,onDone}){
+  const {settings,saveSettings}=useApp()
+  const [form,setForm]=useState({...settings})
+  const [saved,setSaved]=useState(false)
+  function save(){
+    saveSettings(form); setSaved(true)
+    setTimeout(()=>{setSaved(false);onDone()},1000)
+  }
+  return <div className="flex flex-col h-full bg-white">
+    <div className="flex items-center gap-3 px-4 pt-12 pb-4 border-b border-gray-100">
+      <button onClick={onBack} className="p-2 rounded-full hover:bg-gray-100"><Ico k="x" size={20} className="text-gray-600"/></button>
+      <h2 className="text-xl font-bold text-gray-800">Setup</h2>
+    </div>
+    <div className="flex-1 overflow-y-auto scrollable p-4 space-y-5">
+      <div className="bg-blue-50 rounded-2xl p-4 text-sm text-blue-800 space-y-2">
+        <p className="font-semibold">Quick Setup</p>
+        <p>1. <a href="https://console.cloud.google.com" target="_blank" rel="noopener noreferrer" className="underline font-medium">console.cloud.google.com</a> → your project → Enable APIs: <strong>Sheets</strong>, <strong>Drive</strong>, <strong>Calendar</strong></p>
+        <p>2. Credentials → OAuth 2.0 Client ID (Web app) → <strong>Authorized JavaScript origins</strong> → add this site's URL (e.g. <code className="bg-blue-100 px-1 rounded break-all">{window.location.origin}</code>) → Copy Client ID</p>
+        <p>3. Create a blank <a href="https://sheets.google.com" target="_blank" rel="noopener noreferrer" className="underline font-medium">Google Sheet</a> → copy the ID from its URL</p>
+        <p className="text-blue-600 text-xs pt-1">If you're on a new device/domain you just need to paste your existing Client ID and Sheet ID — your data stays in Sheets.</p>
+      </div>
+
+      <div className="space-y-2">
+        <label className="block text-sm font-semibold text-gray-700">Google OAuth Client ID</label>
+        <input value={form.clientId} onChange={e=>setForm({...form,clientId:e.target.value.trim()})}
+          placeholder="123456789-abc.apps.googleusercontent.com"
+          className="w-full border border-gray-200 rounded-xl px-3 py-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+      </div>
+      <div className="space-y-2">
+        <label className="block text-sm font-semibold text-gray-700">Google Sheets ID</label>
+        <p className="text-xs text-gray-400">From URL: docs.google.com/spreadsheets/d/<strong>[ID]</strong>/edit</p>
+        <input value={form.spreadsheetId} onChange={e=>setForm({...form,spreadsheetId:e.target.value.trim()})}
+          placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms"
+          className="w-full border border-gray-200 rounded-xl px-3 py-3 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+      </div>
+      <div className="space-y-2">
+        <label className="block text-sm font-semibold text-gray-700">Google Drive Folder Name</label>
+        <input value={form.driveFolderName} onChange={e=>setForm({...form,driveFolderName:e.target.value})}
+          placeholder="TasksNotesApp"
+          className="w-full border border-gray-200 rounded-xl px-3 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+      </div>
+      <button onClick={save}
+        className="w-full bg-indigo-500 text-white rounded-2xl py-3.5 font-semibold hover:bg-indigo-600 active:bg-indigo-700">
+        {saved?'Saved! ✓':'Save & Continue'}
+      </button>
+      <div className="h-8"/>
+    </div>
+  </div>
+}
+
+// ─── Settings Screen ──────────────────────────────────────────────────────────
+function SettingsScreen({onClose}){
+  const {settings,saveSettings,user,handleSignOut,refreshData,syncing}=useApp()
+  const [form,setForm]=useState({...settings})
+  const [saved,setSaved]=useState(false)
+  function save(){ saveSettings(form); setSaved(true); setTimeout(()=>setSaved(false),2000) }
+  function signOut(){ handleSignOut(); onClose() }
+  return <div className="fixed inset-0 bg-white z-50 flex flex-col">
+    <div className="flex items-center justify-between px-4 pt-12 pb-4 border-b border-gray-100">
+      <h2 className="text-xl font-bold text-gray-800">Settings</h2>
+      <button onClick={onClose} className="p-2 rounded-full hover:bg-gray-100"><Ico k="x" size={20} className="text-gray-500"/></button>
+    </div>
+    <div className="flex-1 overflow-y-auto scrollable p-4 space-y-4">
+      {user&&<div className="bg-indigo-50 rounded-2xl p-4 flex items-center gap-3">
+        <img src={user.picture} alt={user.name} className="w-12 h-12 rounded-full"/>
+        <div className="flex-1 min-w-0"><p className="font-semibold text-gray-800 truncate">{user.name}</p><p className="text-sm text-gray-500 truncate">{user.email}</p></div>
+      </div>}
+      {[
+        {key:'spreadsheetId',label:'Google Sheets ID',hint:'From URL: /spreadsheets/d/[ID]/edit',mono:true,placeholder:'Sheet ID'},
+        {key:'driveFolderName',label:'Drive Folder Name',hint:'Where attachments are saved',placeholder:'TasksNotesApp'},
+        {key:'clientId',label:'OAuth Client ID',hint:'From Google Cloud Console',mono:true,placeholder:'xxx.apps.googleusercontent.com'},
+      ].map(f=><div key={f.key} className="bg-white rounded-2xl border border-gray-200 p-4 space-y-2">
+        <p className="font-semibold text-gray-700 text-sm">{f.label}</p>
+        {f.hint&&<p className="text-xs text-gray-400">{f.hint}</p>}
+        <input value={form[f.key]} onChange={e=>setForm({...form,[f.key]:e.target.value.trim?e.target.value.trim():e.target.value})}
+          placeholder={f.placeholder}
+          className={`w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 ${f.mono?'font-mono':''}`}/>
+      </div>)}
+      <button onClick={save} className="w-full bg-indigo-500 text-white rounded-2xl py-3.5 font-semibold hover:bg-indigo-600">{saved?'Saved! ✓':'Save Settings'}</button>
+      {user&&<button onClick={refreshData} disabled={syncing} className="w-full flex items-center justify-center gap-2 bg-gray-100 text-gray-700 rounded-2xl py-3.5 font-semibold hover:bg-gray-200">
+        <Ico k="sync" size={18} className={syncing?'spin':''}/>{syncing?'Syncing…':'Sync Now'}
+      </button>}
+      {user&&<button onClick={signOut} className="w-full flex items-center justify-center gap-2 bg-red-50 text-red-600 rounded-2xl py-3.5 font-semibold hover:bg-red-100">
+        <Ico k="logout" size={18}/>Sign Out
+      </button>}
+      <div className="h-8"/>
+    </div>
+  </div>
+}
+
+// ─── Calendar Modal ───────────────────────────────────────────────────────────
+function CalendarModal({task,onClose}){
+  const [date,setDate]=useState('')
+  const [time,setTime]=useState('09:00')
+  const [busy,setBusy]=useState(false)
+  async function submit(){
+    if(!date) return
+    setBusy(true)
+    try{ await addToCalendar({summary:task.text,description:task.text,dateTime:`${date}T${time}:00`}); alert('Added to Google Calendar!'); onClose() }
+    catch(e){ alert('Error: '+e.message) }
+    finally{ setBusy(false) }
+  }
+  return <div className="fixed inset-0 bg-black/40 z-40 flex items-end">
+    <div className="bg-white w-full rounded-t-3xl p-6 space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-bold text-lg text-gray-800">Add to Calendar</h3>
+        <button onClick={onClose}><Ico k="x" size={20} className="text-gray-500"/></button>
+      </div>
+      <p className="text-sm text-gray-600 truncate">{task.text}</p>
+      <div>
+        <label className="text-xs text-gray-500 block mb-1">Date</label>
+        <input type="date" value={date} onChange={e=>setDate(e.target.value)} className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+      </div>
+      <div>
+        <label className="text-xs text-gray-500 block mb-1">Time</label>
+        <input type="time" value={time} onChange={e=>setTime(e.target.value)} className="w-full border border-gray-200 rounded-xl px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+      </div>
+      <button onClick={submit} disabled={!date||busy} className="w-full bg-blue-500 text-white rounded-2xl py-3.5 font-semibold hover:bg-blue-600 disabled:opacity-50">
+        {busy?'Adding…':'Add to Google Calendar'}
+      </button>
+    </div>
+  </div>
+}
+
+// ─── Task Item ────────────────────────────────────────────────────────────────
+function TaskItem({task,onUpdate,onDelete,isDragging,isDragOver,onDragHandlePointerDown,folders,onMoveTask}){
+  const {settings}=useApp()
+  const [menuOpen,setMenuOpen]=useState(false)
+  const [editingText,setEditingText]=useState(false)
+  const [editText,setEditText]=useState(task.text)
+  const [newSub,setNewSub]=useState('')
+  const [addingSub,setAddingSub]=useState(false)
+  const [uploading,setUploading]=useState(false)
+  const [calOpen,setCalOpen]=useState(false)
+  const [moveOpen,setMoveOpen]=useState(false)
+  const [busy,setBusy]=useState(false)
+
+  async function run(fn){ setBusy(true); try{ await fn() }catch(e){ alert(e.message) }finally{ setBusy(false) } }
+
+  async function toggleDone(){
+    const done=task.status!=='done'
+    const updated={...task,status:done?'done':'active',doneAt:done?now():''}
+    await run(async()=>{ await updateTask(settings.spreadsheetId,updated); onUpdate(updated) })
+  }
+  async function saveEdit(){
+    if(!editText.trim()) return
+    const updated={...task,text:editText.trim()}
+    await run(async()=>{ await updateTask(settings.spreadsheetId,updated); onUpdate(updated); setEditingText(false) })
+  }
+  async function archive(){
+    const updated={...task,status:task.status==='archived'?'active':'archived'}
+    await run(async()=>{ await updateTask(settings.spreadsheetId,updated); onUpdate(updated) })
+  }
+  async function handleDelete(){
+    setMenuOpen(false)
+    if(!confirm('Delete this task?')) return
+    await run(async()=>{ await deleteTask(settings.spreadsheetId,task.id); onDelete(task.id) })
+  }
+  async function addSub(){
+    if(!newSub.trim()) return
+    const sub={id:newId(),text:newSub.trim(),done:false,createdAt:now(),doneAt:''}
+    const updated={...task,subTasks:[...(task.subTasks||[]),sub]}
+    await run(async()=>{ await updateTask(settings.spreadsheetId,updated); onUpdate(updated); setNewSub(''); setAddingSub(false) })
+  }
+  async function toggleSub(sid){
+    const subs=(task.subTasks||[]).map(s=>s.id===sid?{...s,done:!s.done,doneAt:!s.done?now():''}:s)
+    const allDone=subs.length>0&&subs.every(s=>s.done)
+    const updated={...task,subTasks:subs,status:allDone?'done':task.status==='done'?'active':task.status,doneAt:allDone?now():task.doneAt}
+    await run(async()=>{ await updateTask(settings.spreadsheetId,updated); onUpdate(updated) })
+  }
+  async function deleteSub(sid){
+    const updated={...task,subTasks:(task.subTasks||[]).filter(s=>s.id!==sid)}
+    await run(async()=>{ await updateTask(settings.spreadsheetId,updated); onUpdate(updated) })
+  }
+  async function handleAttach(file){
+    if(!file) return
+    setUploading(true)
+    try{
+      const fid=await getOrCreateFolder(settings.driveFolderName)
+      const sfid=await getOrCreateFolder(`Task_${task.id}`,fid)
+      const up=await uploadFile(file,sfid)
+      const updated={...task,attachments:[...(task.attachments||[]),{id:up.id,name:up.name,url:up.webViewLink,thumbnail:up.thumbnailLink||null}]}
+      await updateTask(settings.spreadsheetId,updated); onUpdate(updated)
+    }catch(e){ alert('Upload failed: '+e.message) }
+    finally{ setUploading(false) }
+  }
+
+  const isDone=task.status==='done'
+  const subs=task.subTasks||[]
+  const atts=task.attachments||[]
+  const doneSubs=subs.filter(s=>s.done).length
+
+  return <>
+    <div
+      data-taskid={task.id}
+      className={`bg-white rounded-2xl border mb-2 overflow-hidden transition-all
+        ${isDone?'border-green-100':'border-gray-100'}
+        ${isDragging?'opacity-40 scale-95 shadow-none':'shadow-sm'}
+        ${isDragOver?'border-indigo-400 border-2 shadow-md':''}`}>
+
+      {/* ── Main compact row ── */}
+      <div className="flex items-center gap-2 px-2 py-3">
+        {/* Drag handle */}
+        <div onPointerDown={onDragHandlePointerDown}
+          className="flex-shrink-0 w-5 h-8 flex items-center justify-center text-gray-200 cursor-grab active:cursor-grabbing touch-none select-none hover:text-gray-400">
+          <Ico k="grip" size={14}/>
+        </div>
+        {/* Checkbox */}
+        <button onClick={toggleDone} disabled={busy} className="flex-shrink-0 w-6 h-6">
+          <Ico k={isDone?'checkCircle':'circle'} size={22} className={isDone?'text-green-500':'text-gray-300'}/>
+        </button>
+        {/* Text + progress */}
+        <div className="flex-1 min-w-0">
+          {editingText
+            ?<div className="flex gap-2 items-center">
+              <input autoFocus value={editText} onChange={e=>setEditText(e.target.value)}
+                onKeyDown={e=>{if(e.key==='Enter')saveEdit();if(e.key==='Escape')setEditingText(false)}}
+                className="flex-1 border border-indigo-400 rounded-lg px-2 py-1 text-sm focus:outline-none"/>
+              <button onClick={saveEdit} className="text-indigo-500 font-semibold text-sm px-1">Save</button>
+              <button onClick={()=>setEditingText(false)} className="text-gray-400">✕</button>
+            </div>
+            :<p className={`text-sm font-medium leading-snug ${isDone?'line-through text-gray-400':'text-gray-800'}`}>
+              {task.text}
+            </p>}
+          {/* Inline progress bar */}
+          {subs.length>0&&!editingText&&<div className="flex items-center gap-1.5 mt-1">
+            <div className="flex-1 h-1 bg-gray-100 rounded-full overflow-hidden">
+              <div className="h-full bg-green-400 rounded-full transition-all" style={{width:`${(doneSubs/subs.length)*100}%`}}/>
+            </div>
+            <span className="text-xs text-gray-400 tabular-nums">{doneSubs}/{subs.length}</span>
+          </div>}
+          {/* Attachment badge */}
+          {atts.length>0&&(atts.length===1
+            ?<a href={atts[0].url} target="_blank" rel="noopener noreferrer"
+                onClick={e=>e.stopPropagation()}
+                className="inline-flex items-center gap-0.5 mt-1 text-xs text-blue-500 hover:text-blue-700 active:opacity-70">
+                <Ico k="clip" size={10}/>{atts[0].name?<span className="max-w-[120px] truncate">{atts[0].name}</span>:'1 file'}
+              </a>
+            :<button onClick={e=>{e.stopPropagation();setMenuOpen(true)}}
+                className="inline-flex items-center gap-0.5 mt-1 text-xs text-blue-500 hover:text-blue-700 active:opacity-70">
+                <Ico k="clip" size={10}/>{atts.length} files
+              </button>
+          )}
+        </div>
+        {/* 3-dots */}
+        <button onClick={()=>setMenuOpen(true)}
+          className="flex-shrink-0 w-8 h-8 flex items-center justify-center rounded-full text-gray-300 hover:text-gray-500 hover:bg-gray-100 active:bg-gray-200">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+            <circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/>
+          </svg>
+        </button>
+      </div>
+
+      {/* ── Sub-tasks ── */}
+      {subs.length>0&&<div className="px-9 pb-2 space-y-0">
+        {subs.map(s=><div key={s.id} className="flex items-center gap-2 py-1.5 border-t border-gray-50">
+          <button onClick={()=>toggleSub(s.id)} className="flex-shrink-0 w-4 h-4">
+            <Ico k={s.done?'checkCircle':'circle'} size={16} className={s.done?'text-green-400':'text-gray-300'}/>
+          </button>
+          <span className={`flex-1 text-xs leading-snug ${s.done?'line-through text-gray-400':'text-gray-600'}`}>{s.text}</span>
+          <button onClick={()=>deleteSub(s.id)} className="text-gray-200 hover:text-red-400 flex-shrink-0">
+            <Ico k="x" size={12}/>
+          </button>
+        </div>)}
+      </div>}
+
+    </div>
+
+    {/* ── 3-dots action bottom sheet ── */}
+    {menuOpen&&<div className="fixed inset-0 bg-black/40 z-50 flex items-end" onClick={()=>setMenuOpen(false)}>
+      <div className="bg-white w-full rounded-t-3xl p-5" onClick={e=>e.stopPropagation()}>
+        {/* Header with task info + timestamps */}
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div className="flex-1 min-w-0">
+            <p className="font-semibold text-gray-800 text-sm leading-snug">{task.text}</p>
+            <div className="mt-1.5 space-y-0.5">
+              <p className="text-xs text-gray-400">📅 Created: {fmtDate(task.createdAt)}</p>
+              {task.modifiedAt&&task.modifiedAt!==task.createdAt&&
+                <p className="text-xs text-gray-400">✏️ Modified: {fmtDate(task.modifiedAt)}</p>}
+              {isDone&&task.doneAt&&
+                <p className="text-xs text-green-500">✅ Done: {fmtDate(task.doneAt)}</p>}
+              {task.folder&&<p className="text-xs text-indigo-400">📁 {task.folder}</p>}
+            </div>
+          </div>
+          <button onClick={()=>setMenuOpen(false)} className="text-gray-400 flex-shrink-0"><Ico k="x" size={20}/></button>
+        </div>
+
+        {/* Attachments preview */}
+        {atts.length>0&&<div className="flex flex-wrap gap-1.5 mb-4 pb-4 border-b border-gray-100">
+          {atts.map(a=><a key={a.id} href={a.url} target="_blank" rel="noopener noreferrer"
+            className="flex items-center gap-1 bg-gray-50 border border-gray-200 rounded-lg px-2 py-1 text-xs text-blue-600 hover:bg-blue-50">
+            {a.thumbnail?<img src={a.thumbnail} alt="" className="w-5 h-5 rounded object-cover"/>:<Ico k="clip" size={11}/>}
+            <span className="max-w-[90px] truncate">{a.name}</span>
+            <Ico k="ext" size={9}/>
+          </a>)}
+        </div>}
+
+        {/* Add sub-task inline from menu */}
+        {addingSub&&<div className="flex gap-1.5 mb-3">
+          <input autoFocus value={newSub} onChange={e=>setNewSub(e.target.value)}
+            onKeyDown={e=>{if(e.key==='Enter')addSub();if(e.key==='Escape'){setAddingSub(false);setNewSub('')}}}
+            placeholder="Sub-task…"
+            className="flex-1 border border-indigo-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400 bg-indigo-50"/>
+          <button onClick={addSub} disabled={!newSub.trim()||busy} className="bg-indigo-500 text-white rounded-xl px-3 py-2 disabled:opacity-40 text-sm font-medium">Add</button>
+          <button onClick={()=>{setAddingSub(false);setNewSub('')}} className="text-gray-400 px-1">✕</button>
+        </div>}
+
+        {/* Action grid */}
+        <div className="grid grid-cols-4 gap-2">
+          {[
+            {ico:'edit',    label:'Edit',    fn:()=>{ setMenuOpen(false); setEditText(task.text); setEditingText(true) }},
+            {ico:'plus',    label:'Sub-task',fn:()=>{ setAddingSub(true) }, green:true},
+            {ico:'archive', label:task.status==='archived'?'Unarchive':'Archive', fn:()=>{ setMenuOpen(false); archive() }},
+            {ico:'calendar',label:'Calendar',fn:()=>{ setMenuOpen(false); setCalOpen(true) }, blue:true},
+            ...(folders&&folders.length>1?[{ico:'grip',label:'Move',fn:()=>{ setMenuOpen(false); setMoveOpen(true) }}]:[]),
+            {ico:'trash',   label:'Delete',  fn:handleDelete, red:true},
+          ].map(btn=>(
+            <button key={btn.label} onClick={btn.fn}
+              className={`flex flex-col items-center gap-1.5 p-3 rounded-2xl transition-colors
+                ${btn.red?'bg-red-50 hover:bg-red-100':btn.green?'bg-green-50 hover:bg-green-100':btn.blue?'bg-blue-50 hover:bg-blue-100':'bg-gray-50 hover:bg-gray-100'}`}>
+              <Ico k={btn.ico} size={20} className={btn.red?'text-red-500':btn.green?'text-green-600':btn.blue?'text-blue-500':'text-gray-600'}/>
+              <span className={`text-xs font-medium ${btn.red?'text-red-500':btn.green?'text-green-600':btn.blue?'text-blue-500':'text-gray-600'}`}>{btn.label}</span>
+            </button>
+          ))}
+          {/* Attach file button */}
+          <label className="flex flex-col items-center gap-1.5 p-3 rounded-2xl bg-gray-50 hover:bg-gray-100 cursor-pointer transition-colors">
+            <Ico k="clip" size={20} className={uploading?'text-gray-300':'text-gray-600'}/>
+            <span className="text-xs font-medium text-gray-600">{uploading?'…':'Attach'}</span>
+            <input type="file" className="hidden" disabled={uploading}
+              onChange={e=>{ if(e.target.files[0]){ handleAttach(e.target.files[0]); e.target.value='' } }}/>
+          </label>
+        </div>
+      </div>
+    </div>}
+
+    {calOpen&&<CalendarModal task={task} onClose={()=>setCalOpen(false)}/>}
+    {moveOpen&&folders&&<MoveTaskModal task={task} folders={folders}
+      onMove={f=>{ onMoveTask&&onMoveTask(f) }} onClose={()=>setMoveOpen(false)}/>}
+  </>
+}
+
+// ─── Add Task Modal ───────────────────────────────────────────────────────────
+function AddTaskModal({onClose,onAdd,folder}){
+  const {settings}=useApp()
+  const [text,setText]=useState('')
+  const [busy,setBusy]=useState(false)
+  const [err,setErr]=useState('')
+  async function submit(e){
+    e.preventDefault(); if(!text.trim()){setErr('Enter a task');return}
+    setBusy(true); setErr('')
+    try{ const t=await addTask(settings.spreadsheetId,text.trim(),folder); onAdd(t); onClose() }
+    catch(e){ setErr(e.message) }
+    finally{ setBusy(false) }
+  }
+  return <div className="fixed inset-0 bg-black/40 z-40 flex items-end">
+    <div className="bg-white w-full rounded-t-3xl p-6">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="font-bold text-xl text-gray-800">New Task</h3>
+        <button onClick={onClose}><Ico k="x" size={22} className="text-gray-500"/></button>
+      </div>
+      <p className="text-xs text-indigo-500 font-medium mb-4">📁 {folder}</p>
+      <form onSubmit={submit} className="space-y-4">
+        <textarea autoFocus value={text} onChange={e=>setText(e.target.value)} placeholder="What needs to be done?" rows={3}
+          className="w-full border border-gray-200 rounded-2xl px-4 py-3 text-base resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+        {err&&<p className="text-sm text-red-500">{err}</p>}
+        <button type="submit" disabled={busy||!text.trim()}
+          className="w-full flex items-center justify-center gap-2 bg-indigo-500 text-white rounded-2xl py-3.5 font-semibold hover:bg-indigo-600 disabled:opacity-50">
+          <Ico k="plus" size={20} className="text-white"/>{busy?'Adding…':'Add Task'}
+        </button>
+      </form>
+    </div>
+  </div>
+}
+
+// ─── Folder helpers ───────────────────────────────────────────────────────────
+const DEFAULT_FOLDERS = ['Personal','Work','Private']
+function loadFolders(){ try{ return JSON.parse(localStorage.getItem('taskFolders')||'null')||DEFAULT_FOLDERS }catch{ return DEFAULT_FOLDERS } }
+function saveFolders(f){ localStorage.setItem('taskFolders',JSON.stringify(f)) }
+
+// ─── Folder Name Modal (add / rename) ────────────────────────────────────────
+function FolderNameModal({initial='',title,onSave,onClose}){
+  const [name,setName]=useState(initial)
+  function submit(e){
+    e.preventDefault()
+    if(!name.trim()) return
+    onSave(name.trim())
+    onClose()
+  }
+  return <div className="fixed inset-0 bg-black/40 z-50 flex items-end">
+    <div className="bg-white w-full rounded-t-3xl p-6 space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-bold text-lg text-gray-800">{title}</h3>
+        <button onClick={onClose}><Ico k="x" size={20} className="text-gray-500"/></button>
+      </div>
+      <form onSubmit={submit} className="space-y-3">
+        <input autoFocus value={name} onChange={e=>setName(e.target.value)}
+          placeholder="Folder name…"
+          className="w-full border border-gray-200 rounded-2xl px-4 py-3 text-base focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+        <button type="submit" disabled={!name.trim()}
+          className="w-full bg-indigo-500 text-white rounded-2xl py-3.5 font-semibold hover:bg-indigo-600 disabled:opacity-50">
+          Save
+        </button>
+      </form>
+    </div>
+  </div>
+}
+
+// ─── Move Task Modal ──────────────────────────────────────────────────────────
+function MoveTaskModal({task,folders,onMove,onClose}){
+  return <div className="fixed inset-0 bg-black/40 z-50 flex items-end">
+    <div className="bg-white w-full rounded-t-3xl p-6 space-y-3">
+      <div className="flex items-center justify-between mb-1">
+        <h3 className="font-bold text-lg text-gray-800">Move to folder</h3>
+        <button onClick={onClose}><Ico k="x" size={20} className="text-gray-500"/></button>
+      </div>
+      <p className="text-sm text-gray-500 truncate">"{task.text}"</p>
+      <div className="space-y-2 pt-1">
+        {folders.filter(f=>f!==task.folder).map(f=>(
+          <button key={f} onClick={()=>{ onMove(f); onClose() }}
+            className="w-full flex items-center gap-3 bg-gray-50 hover:bg-indigo-50 border border-gray-100 hover:border-indigo-200 rounded-2xl px-4 py-3 text-left transition-colors">
+            <span className="w-8 h-8 bg-indigo-100 rounded-xl flex items-center justify-center text-indigo-600 font-bold text-sm flex-shrink-0">
+              {f[0].toUpperCase()}
+            </span>
+            <span className="font-medium text-gray-700">{f}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  </div>
+}
+
+// ─── Tasks Tab ────────────────────────────────────────────────────────────────
+function TasksTab(){
+  const {tasks,setTasks,loading}=useApp()
+  const [sub,setSub]=useState('active')
+  const [showAdd,setShowAdd]=useState(false)
+
+  // ── Folders ──
+  const [folders,setFolders]=useState(loadFolders)
+  const [activeFolder,setActiveFolder]=useState(()=>loadFolders()[0]||'Personal')
+  const [folderModal,setFolderModal]=useState(null) // null | 'add' | {rename: folderName}
+  const [folderMenuFor,setFolderMenuFor]=useState(null) // folder name showing context menu
+  const lpTimer=useRef(null)
+
+  function handleFolderLongPress(f){
+    lpTimer.current=setTimeout(()=>setFolderMenuFor(f),500)
+  }
+  function cancelLongPress(){ clearTimeout(lpTimer.current) }
+
+  function addFolder(name){
+    if(folders.includes(name)) return
+    const next=[...folders,name]
+    saveFolders(next); setFolders(next); setActiveFolder(name)
+  }
+  function renameFolder(oldName,newName){
+    if(!newName||folders.includes(newName)) return
+    const next=folders.map(f=>f===oldName?newName:f)
+    saveFolders(next); setFolders(next)
+    if(activeFolder===oldName) setActiveFolder(newName)
+    // update tasks in that folder
+    setTasks(prev=>prev.map(t=>t.folder===oldName?{...t,folder:newName}:t))
+  }
+  function deleteFolder(name){
+    if(folders.length<=1){alert('You need at least one folder.');return}
+    if(!confirm(`Delete folder "${name}"? Tasks inside will move to "${folders.filter(f=>f!==name)[0]}".`)) return
+    const fallback=folders.filter(f=>f!==name)[0]
+    const next=folders.filter(f=>f!==name)
+    saveFolders(next); setFolders(next)
+    if(activeFolder===name) setActiveFolder(fallback)
+    setTasks(prev=>prev.map(t=>t.folder===name?{...t,folder:fallback}:t))
+  }
+
+  // ── Order ──
+  const orderKey=`taskOrder_${activeFolder}_${sub}`
+  const [orderMap,setOrderMap]=useState(()=>{ try{return JSON.parse(localStorage.getItem(orderKey)||'{}')}catch{return {}} })
+  useEffect(()=>{ try{setOrderMap(JSON.parse(localStorage.getItem(`taskOrder_${activeFolder}_${sub}`)||'{}'))}catch{setOrderMap({})} },[activeFolder,sub])
+  function saveOrder(ids){ const m={}; ids.forEach((id,i)=>m[id]=i); localStorage.setItem(`taskOrder_${activeFolder}_${sub}`,JSON.stringify(m)); setOrderMap(m) }
+  function sortedList(items){ return [...items].sort((a,b)=>{ const oa=orderMap[a.id]??99999,ob=orderMap[b.id]??99999; return oa!==ob?oa-ob:new Date(b.createdAt)-new Date(a.createdAt) }) }
+
+  // ── Drag ──
+  const [dragId,setDragId]=useState(null)
+  const [dragOverId,setDragOverId]=useState(null)
+  const containerRef=useRef(null)
+  function startDrag(e,id){ e.preventDefault(); e.currentTarget.setPointerCapture(e.pointerId); setDragId(id); setDragOverId(null) }
+  function onPointerMove(e){ if(!dragId) return; const els=document.elementsFromPoint(e.clientX,e.clientY); for(const el of els){ const tid=el.closest('[data-taskid]')?.dataset?.taskid; if(tid&&tid!==dragId){setDragOverId(tid);break} } }
+  function onPointerUp(){
+    if(dragId&&dragOverId&&dragId!==dragOverId){
+      const cur=sortedList(tasks.filter(t=>t.folder===activeFolder&&t.status===sub))
+      const fi=cur.findIndex(t=>t.id===dragId), ti=cur.findIndex(t=>t.id===dragOverId)
+      if(fi!==-1&&ti!==-1){ const r=[...cur]; const [m]=r.splice(fi,1); r.splice(ti,0,m); saveOrder(r.map(t=>t.id)) }
+    }
+    setDragId(null); setDragOverId(null)
+  }
+
+  const folderTasks=tasks.filter(t=>t.folder===activeFolder)
+  const active=folderTasks.filter(t=>t.status==='active')
+  const done=folderTasks.filter(t=>t.status==='done')
+  const list=sortedList(sub==='active'?active:done)
+
+  const upd=u=>setTasks(p=>p.map(t=>t.id===u.id?u:t))
+  const del=id=>{ setTasks(p=>p.filter(t=>t.id!==id)); setDragId(null) }
+  const add=t=>{ setTasks(p=>[t,...p]); setSub('active'); saveOrder([t.id,...sortedList(active).map(x=>x.id)]) }
+  function moveTask(task,toFolder){ const updated={...task,folder:toFolder,modifiedAt:now()}; updateTask(settings?.spreadsheetId,updated).catch(()=>{}); upd(updated) }
+
+  const {settings}=useApp()
+
+  return <div ref={containerRef} className="flex flex-col h-full relative" onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerLeave={onPointerUp}>
+
+    {/* ── Folder tabs ── */}
+    <div className="flex items-center gap-0 px-3 pt-3 pb-1 overflow-x-auto no-sb">
+      {folders.map(f=>(
+        <button key={f}
+          onClick={()=>setActiveFolder(f)}
+          onPointerDown={()=>handleFolderLongPress(f)}
+          onPointerUp={cancelLongPress}
+          onPointerLeave={cancelLongPress}
+          className={`flex-shrink-0 flex items-center gap-1.5 px-3.5 py-2 mr-1.5 rounded-2xl text-sm font-semibold transition-all ${
+            activeFolder===f
+              ? 'bg-indigo-500 text-white shadow-sm'
+              : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+          }`}
+        >
+          <span className="w-5 h-5 rounded-lg flex items-center justify-center text-xs font-bold"
+            style={{background: activeFolder===f?'rgba(255,255,255,0.25)':'rgba(0,0,0,0.06)'}}>
+            {f[0].toUpperCase()}
+          </span>
+          {f}
+          <span className={`text-xs rounded-full px-1.5 py-0.5 font-medium ${activeFolder===f?'bg-white/20 text-white':'bg-gray-200 text-gray-500'}`}>
+            {tasks.filter(t=>t.folder===f&&t.status==='active').length}
+          </span>
+        </button>
+      ))}
+      {/* Add folder button */}
+      <button onClick={()=>setFolderModal('add')}
+        className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-2xl bg-gray-100 text-gray-400 hover:bg-indigo-50 hover:text-indigo-500 transition-colors">
+        <Ico k="plus" size={18}/>
+      </button>
+    </div>
+
+    {/* Folder context menu */}
+    {folderMenuFor&&<div className="fixed inset-0 z-40" onClick={()=>setFolderMenuFor(null)}>
+      <div className="absolute top-24 left-1/2 -translate-x-1/2 bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden min-w-[200px]"
+        onClick={e=>e.stopPropagation()}>
+        <div className="px-4 py-3 border-b border-gray-100 font-semibold text-gray-700">📁 {folderMenuFor}</div>
+        <button onClick={()=>{ setFolderModal({rename:folderMenuFor}); setFolderMenuFor(null) }}
+          className="w-full flex items-center gap-3 px-4 py-3 text-sm text-gray-700 hover:bg-gray-50">
+          <Ico k="edit" size={16}/>Rename folder
+        </button>
+        <button onClick={()=>{ deleteFolder(folderMenuFor); setFolderMenuFor(null) }}
+          className="w-full flex items-center gap-3 px-4 py-3 text-sm text-red-500 hover:bg-red-50">
+          <Ico k="trash" size={16}/>Delete folder
+        </button>
+      </div>
+    </div>}
+
+    {/* ── Active / Done sub-tabs ── */}
+    <div className="flex bg-gray-100 rounded-2xl mx-4 mt-2 mb-2 p-1 gap-1">
+      {[['active',`Active (${active.length})`],['done',`Done (${done.length})`]].map(([k,l])=>
+        <button key={k} onClick={()=>setSub(k)}
+          className={`flex-1 py-2 rounded-xl text-sm font-semibold transition-all ${sub===k?'bg-white text-indigo-600 shadow-sm':'text-gray-500'}`}>{l}</button>)}
+    </div>
+
+    {/* ── Task list ── */}
+    <div className="flex-1 overflow-y-auto scrollable px-4 pb-24 no-sb">
+      {loading
+        ?<div className="flex justify-center items-center h-32"><Ico k="sync" size={24} className="text-indigo-400 spin"/></div>
+        :list.length===0
+          ?<div className="flex flex-col items-center justify-center h-48 text-gray-400">
+            <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mb-3">
+              <Ico k="task" size={32} className="text-gray-300"/>
+            </div>
+            <p className="font-medium">{sub==='active'?`No tasks in ${activeFolder}`:'No completed tasks'}</p>
+            {sub==='active'&&<p className="text-sm mt-1">Tap + to add your first task</p>}
+          </div>
+          :list.map(t=><TaskItem
+            key={t.id} task={t}
+            onUpdate={upd} onDelete={del}
+            folders={folders}
+            onMoveTask={(toFolder)=>moveTask(t,toFolder)}
+            isDragging={dragId===t.id}
+            isDragOver={dragOverId===t.id&&dragId!==t.id}
+            onDragHandlePointerDown={e=>startDrag(e,t.id)}
+          />)
+      }
+    </div>
+
+    {/* FAB */}
+    {sub==='active'&&<button onClick={()=>setShowAdd(true)}
+      className="absolute bottom-6 right-4 w-14 h-14 bg-indigo-500 rounded-full shadow-lg flex items-center justify-center hover:bg-indigo-600 active:bg-indigo-700">
+      <Ico k="plus" size={28} className="text-white"/>
+    </button>}
+
+    {showAdd&&<AddTaskModal onClose={()=>setShowAdd(false)} onAdd={add} folder={activeFolder}/>}
+
+    {folderModal==='add'&&<FolderNameModal title="New Folder" onSave={addFolder} onClose={()=>setFolderModal(null)}/>}
+    {folderModal?.rename&&<FolderNameModal title="Rename Folder" initial={folderModal.rename}
+      onSave={name=>renameFolder(folderModal.rename,name)} onClose={()=>setFolderModal(null)}/>}
+  </div>
+}
+
+// ─── Note Item ────────────────────────────────────────────────────────────────
+function NoteItem({note,onUpdate,onDelete}){
+  const {settings}=useApp()
+  const [expanded,setExpanded]=useState(false)
+  const [editing,setEditing]=useState(false)
+  const [form,setForm]=useState({title:note.title,project:note.project,body:note.body})
+  const [uploading,setUploading]=useState(false)
+  const [busy,setBusy]=useState(false)
+  const [copied,setCopied]=useState(false)
+  async function run(fn){ setBusy(true); try{ await fn() }catch(e){ alert(e.message) }finally{ setBusy(false) } }
+  async function saveEdit(){
+    if(!form.title.trim()) return
+    const updated={...note,...form}
+    await run(async()=>{ await updateNote(settings.spreadsheetId,updated); onUpdate(updated); setEditing(false) })
+  }
+  async function archive(){
+    const updated={...note,status:note.status==='archived'?'active':'archived'}
+    await run(async()=>{ await updateNote(settings.spreadsheetId,updated); onUpdate(updated) })
+  }
+  async function handleDelete(){
+    if(!confirm('Delete this note?')) return
+    await run(async()=>{ await deleteNote(settings.spreadsheetId,note.id); onDelete(note.id) })
+  }
+  function copyNote(){
+    const txt=[note.title,note.project?`Project: ${note.project}`:'','',note.body,'',
+      (note.attachments||[]).map(a=>a.url).join('\n')].filter(l=>l!==undefined).join('\n').trim()
+    navigator.clipboard.writeText(txt); setCopied(true); setTimeout(()=>setCopied(false),2000)
+  }
+  function shareNote(){
+    const txt=[note.title,note.project?`Project: ${note.project}`:'','',note.body].filter(Boolean).join('\n')
+    if(navigator.share) navigator.share({title:note.title,text:txt}); else copyNote()
+  }
+  async function handleAttach(e){
+    const files=Array.from(e.target.files); if(!files.length) return
+    setUploading(true)
+    try{
+      let cur={...note}
+      for(const file of files){
+        const fid=await getOrCreateFolder(settings.driveFolderName)
+        const sfid=await getOrCreateFolder(`Note_${note.id}`,fid)
+        const up=await uploadFile(file,sfid)
+        cur={...cur,attachments:[...(cur.attachments||[]),{id:up.id,name:up.name,url:up.webViewLink,thumbnail:up.thumbnailLink||null}]}
+        await updateNote(settings.spreadsheetId,cur)
+      }
+      onUpdate(cur)
+    }catch(e){ alert('Upload failed: '+e.message) }
+    finally{ setUploading(false); e.target.value='' }
+  }
+  const atts=note.attachments||[]
+  return <div className="bg-white rounded-2xl shadow-sm border border-gray-100 mb-3 overflow-hidden">
+    <div className="p-4">
+      {editing?<div className="space-y-3">
+        <input value={form.title} onChange={e=>setForm({...form,title:e.target.value})} placeholder="Title"
+          className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+        <input value={form.project} onChange={e=>setForm({...form,project:e.target.value})} placeholder="Project (optional)"
+          className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+        <textarea value={form.body} onChange={e=>setForm({...form,body:e.target.value})} rows={5} placeholder="Note content…"
+          className="w-full border border-gray-200 rounded-xl px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+        <div className="flex gap-2">
+          <button onClick={saveEdit} disabled={busy} className="flex-1 bg-indigo-500 text-white rounded-xl py-2.5 font-semibold text-sm hover:bg-indigo-600 disabled:opacity-50">{busy?'Saving…':'Save'}</button>
+          <button onClick={()=>setEditing(false)} className="flex-1 bg-gray-100 text-gray-600 rounded-xl py-2.5 font-semibold text-sm">Cancel</button>
+        </div>
+      </div>:<>
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex-1 min-w-0">
+            <h3 className="font-bold text-gray-800 text-base leading-snug">{note.title}</h3>
+            {note.project&&<span className="inline-block mt-1 text-xs bg-indigo-50 text-indigo-600 px-2 py-0.5 rounded-full font-medium">{note.project}</span>}
+          </div>
+          <button onClick={()=>setExpanded(!expanded)} className="text-gray-400 mt-0.5 flex-shrink-0 w-5 h-5">
+            <Ico k={expanded?'chevUp':'chevDown'} size={18}/>
+          </button>
+        </div>
+        <p className={`mt-2 text-sm text-gray-600 leading-relaxed ${expanded?'':'line-clamp-3'}`}>{note.body}</p>
+        <div className="mt-1.5 space-y-0.5">
+          <p className="text-xs text-gray-400">Created: {fmtDate(note.createdAt)}</p>
+          {note.modifiedAt&&note.modifiedAt!==note.createdAt&&<p className="text-xs text-gray-400">Modified: {fmtDate(note.modifiedAt)}</p>}
+        </div>
+        {expanded&&atts.length>0&&<div className="mt-3 pt-3 border-t border-gray-50">
+          <p className="text-xs font-semibold text-gray-500 mb-2 uppercase tracking-wide">Files</p>
+          <div className="flex flex-wrap gap-2">
+            {atts.map(a=><a key={a.id} href={a.url} target="_blank" rel="noopener noreferrer"
+              className="flex items-center gap-1.5 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 text-xs text-blue-600 hover:bg-blue-50">
+              {a.thumbnail?<img src={a.thumbnail} alt="" className="w-8 h-8 rounded object-cover"/>:<Ico k="clip" size={12}/>}
+              <span className="max-w-[100px] truncate">{a.name}</span>
+              <Ico k="ext" size={10}/>
+            </a>)}
+          </div>
+        </div>}
+        <div className="flex items-center gap-1 mt-3 pt-3 border-t border-gray-50 flex-wrap">
+          <ActionBtn ico="copy" label={copied?'Copied!':'Copy'} onClick={copyNote}/>
+          <ActionBtn ico="share" label="Share" onClick={shareNote}/>
+          <ActionBtn ico="edit" label="Edit" onClick={()=>{setForm({title:note.title,project:note.project,body:note.body});setEditing(true)}}/>
+          <ActionBtn ico="archive" label={note.status==='archived'?'Unarchive':'Archive'} onClick={archive}/>
+          <div className="flex-1"/>
+          <label className={`flex items-center gap-1 text-xs text-gray-500 bg-gray-50 rounded-lg px-2.5 py-1.5 cursor-pointer hover:bg-gray-100 ${uploading?'opacity-50':''}`}>
+            <Ico k="clip" size={13}/>{uploading?'…':'File'}
+            <input type="file" multiple className="hidden" onChange={handleAttach} disabled={uploading} accept="image/*,*/*"/>
+          </label>
+          <ActionBtn ico="trash" label="" color="red" onClick={handleDelete}/>
+        </div>
+      </>}
+    </div>
+  </div>
+}
+
+// ─── Add Note Modal ───────────────────────────────────────────────────────────
+function AddNoteModal({onClose,onAdd}){
+  const {settings}=useApp()
+  const [form,setForm]=useState({title:'',project:'',body:''})
+  const [files,setFiles]=useState([])
+  const [busy,setBusy]=useState(false)
+  const [err,setErr]=useState('')
+  async function submit(e){
+    e.preventDefault()
+    if(!form.title.trim()){setErr('Title required');return}
+    if(!form.body.trim()){setErr('Note content required');return}
+    setBusy(true); setErr('')
+    try{
+      let note=await addNote(settings.spreadsheetId,form)
+      for(const file of files){
+        const fid=await getOrCreateFolder(settings.driveFolderName)
+        const sfid=await getOrCreateFolder(`Note_${note.id}`,fid)
+        const up=await uploadFile(file,sfid)
+        note={...note,attachments:[...(note.attachments||[]),{id:up.id,name:up.name,url:up.webViewLink,thumbnail:up.thumbnailLink||null}]}
+        await updateNote(settings.spreadsheetId,note)
+      }
+      onAdd(note); onClose()
+    }catch(e){ setErr(e.message) }
+    finally{ setBusy(false) }
+  }
+  return <div className="fixed inset-0 bg-black/40 z-40 flex items-end">
+    <div className="bg-white w-full rounded-t-3xl max-h-[90vh] overflow-y-auto scrollable">
+      <div className="p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-bold text-xl text-gray-800">New Note</h3>
+          <button onClick={onClose}><Ico k="x" size={22} className="text-gray-500"/></button>
+        </div>
+        <form onSubmit={submit} className="space-y-3">
+          <input autoFocus value={form.title} onChange={e=>setForm({...form,title:e.target.value})} placeholder="Title *"
+            className="w-full border border-gray-200 rounded-2xl px-4 py-3 text-base font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          <input value={form.project} onChange={e=>setForm({...form,project:e.target.value})} placeholder="Project (optional)"
+            className="w-full border border-gray-200 rounded-2xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          <textarea value={form.body} onChange={e=>setForm({...form,body:e.target.value})} placeholder="Write your note here…" rows={6}
+            className="w-full border border-gray-200 rounded-2xl px-4 py-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500"/>
+          {files.length>0&&<div className="flex flex-wrap gap-2">
+            {files.map((f,i)=><div key={i} className="flex items-center gap-1.5 bg-gray-100 rounded-lg px-2.5 py-1.5 text-xs text-gray-600">
+              <Ico k="clip" size={12}/><span className="max-w-[100px] truncate">{f.name}</span>
+              <button type="button" onClick={()=>setFiles(p=>p.filter((_,j)=>j!==i))} className="text-gray-400 hover:text-red-400">✕</button>
+            </div>)}
+          </div>}
+          <label className="flex items-center gap-2 text-sm text-gray-500 cursor-pointer bg-gray-50 rounded-2xl px-4 py-3 hover:bg-gray-100 border border-dashed border-gray-200">
+            <Ico k="clip" size={16}/>Attach files or photos
+            <input type="file" multiple className="hidden" onChange={e=>setFiles(p=>[...p,...Array.from(e.target.files)])} accept="image/*,*/*"/>
+          </label>
+          {err&&<p className="text-sm text-red-500">{err}</p>}
+          <button type="submit" disabled={busy||!form.title.trim()||!form.body.trim()}
+            className="w-full flex items-center justify-center gap-2 bg-indigo-500 text-white rounded-2xl py-3.5 font-semibold hover:bg-indigo-600 disabled:opacity-50">
+            <Ico k="plus" size={20} className="text-white"/>{busy?'Saving…':'Add Note'}
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+}
+
+// ─── Notes Tab ────────────────────────────────────────────────────────────────
+function NotesTab(){
+  const {notes,setNotes,loading}=useApp()
+  const [sub,setSub]=useState('active')
+  const [showAdd,setShowAdd]=useState(false)
+  const active=notes.filter(n=>n.status==='active')
+  const archived=notes.filter(n=>n.status==='archived')
+  const list=sub==='active'?active:archived
+  const upd=u=>setNotes(p=>p.map(n=>n.id===u.id?u:n))
+  const del=id=>setNotes(p=>p.filter(n=>n.id!==id))
+  const add=n=>{setNotes(p=>[n,...p]);setSub('active')}
+  return <div className="flex flex-col h-full relative">
+    <div className="flex bg-gray-100 rounded-2xl m-4 mb-2 p-1 gap-1">
+      {[['active',`Active (${active.length})`],['archived',`Archived (${archived.length})`]].map(([k,l])=>
+        <button key={k} onClick={()=>setSub(k)}
+          className={`flex-1 py-2 rounded-xl text-sm font-semibold transition-all ${sub===k?'bg-white text-indigo-600 shadow-sm':'text-gray-500'}`}>{l}</button>)}
+    </div>
+    <div className="flex-1 overflow-y-auto scrollable px-4 pb-24 no-sb">
+      {loading?<div className="flex justify-center items-center h-32"><Ico k="sync" size={24} className="text-indigo-400 spin"/></div>
+      :list.length===0?<div className="flex flex-col items-center justify-center h-48 text-gray-400">
+          <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mb-3">
+            <Ico k="note" size={32} className="text-gray-300"/>
+          </div>
+          <p className="font-medium">{sub==='active'?'No notes yet':'No archived notes'}</p>
+          {sub==='active'&&<p className="text-sm mt-1">Tap + to write your first note</p>}
+        </div>
+      :list.map(n=><NoteItem key={n.id} note={n} onUpdate={upd} onDelete={del}/>)}
+    </div>
+    {sub==='active'&&<button onClick={()=>setShowAdd(true)}
+      className="absolute bottom-6 right-4 w-14 h-14 bg-indigo-500 rounded-full shadow-lg flex items-center justify-center hover:bg-indigo-600 active:bg-indigo-700">
+      <Ico k="plus" size={28} className="text-white"/>
+    </button>}
+    {showAdd&&<AddNoteModal onClose={()=>setShowAdd(false)} onAdd={add}/>}
+  </div>
+}
+
+// ─── App Shell ────────────────────────────────────────────────────────────────
+function Shell(){
+  const {user,syncing}=useApp()
+  const [tab,setTab]=useState('tasks')
+  const [showSettings,setShowSettings]=useState(false)
+  if(!user) return <LoginScreen/>
+  return <div className="flex flex-col h-full bg-gray-50">
+    <div className="flex items-center justify-between px-5 pt-12 pb-3 bg-white border-b border-gray-100">
+      <div className="flex items-center gap-2">
+        <div className="w-8 h-8 bg-indigo-500 rounded-xl flex items-center justify-center">
+          <Ico k="task" size={18} className="text-white"/>
+        </div>
+        <h1 className="text-lg font-bold text-gray-800">Tasks & Notes</h1>
+      </div>
+      <div className="flex items-center gap-2">
+        {syncing&&<Ico k="sync" size={16} className="text-indigo-400 spin"/>}
+        <button onClick={()=>setShowSettings(true)} className="w-9 h-9 flex items-center justify-center rounded-full hover:bg-gray-100">
+          <Ico k="settings" size={20} className="text-gray-600"/>
+        </button>
+      </div>
+    </div>
+    <div className="flex border-b border-gray-100 bg-white">
+      {[['tasks','task','Tasks'],['notes','note','Notes']].map(([id,ico,label])=>
+        <button key={id} onClick={()=>setTab(id)}
+          className={`flex-1 flex items-center justify-center gap-1.5 py-3 text-sm font-semibold border-b-2 transition-colors ${tab===id?'border-indigo-500 text-indigo-600':'border-transparent text-gray-400 hover:text-gray-600'}`}>
+          <Ico k={ico} size={16}/>{label}
+        </button>)}
+    </div>
+    <div className="flex-1 overflow-hidden">
+      {tab==='tasks'?<TasksTab/>:<NotesTab/>}
+    </div>
+    {showSettings&&<SettingsScreen onClose={()=>setShowSettings(false)}/>}
+  </div>
+}
+
+function App(){
+  return <AppProvider><Shell/></AppProvider>
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>)
+</script>
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
