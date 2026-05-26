@@ -1,25 +1,26 @@
 {
-  "name": "Tasks & Notes",
-  "short_name": "Tasks",
-  "description": "Personal task and note manager with Google Sheets sync",
-  "start_url": "./app.html",
-  "scope": "./",
+  "background_color": "#ffffff",
+  "dir": "ltr",
   "display": "standalone",
-  "background_color": "#f0f4ff",
+  "name": "Tasks",
+  "orientation": "any",
+  "scope": "/",
+  "short_name": "Tasks",
+  "start_url": "./app.html",
   "theme_color": "#6366f1",
-  "orientation": "portrait-primary",
   "icons": [
     {
-      "src": "./icons/icon-192.png",
+      "src": "https://safwan092.github.io/tasks-notes/icons/icon-192.png",
+      "type": "image/png",
       "sizes": "192x192",
-      "type": "image/png",
-      "purpose": "any"
-    },
-    {
-      "src": "./icons/icon-512.png",
-      "sizes": "512x512",
-      "type": "image/png",
-      "purpose": "any maskable"
+      "isSquare": true,
+      "isPng": true,
+      "isWebp": false,
+      "isJpg": false,
+      "width": 192,
+      "is512x512": false,
+      "is256x256": false,
+      "is192x192": true
     }
   ]
 }
