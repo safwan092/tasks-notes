@@ -142,12 +142,14 @@ const DEFAULT_SETTINGS = { spreadsheetId:'', driveFolderName:'TasksNotesApp', cl
 
 function AppProvider({children}){
   const [settings,setSettingsState]=useState(()=>{ try{return JSON.parse(localStorage.getItem('appSettings')||'null')||DEFAULT_SETTINGS}catch{return DEFAULT_SETTINGS} })
-  const [user,setUser]=useState(null)
+  const [user,setUser]=useState(()=>{ try{return JSON.parse(localStorage.getItem('savedUser')||'null')}catch{return null} })
   const [tasks,setTasks]=useState([])
   const [notes,setNotes]=useState([])
   const [loading,setLoading]=useState(false)
   const [syncing,setSyncing]=useState(false)
   const [error,setError]=useState(null)
+  const [autoSigningIn,setAutoSigningIn]=useState(false)
+  const refreshTimer=useRef(null)
 
   function saveSettings(s){ localStorage.setItem('appSettings',JSON.stringify(s)); setSettingsState(s) }
 
@@ -163,11 +165,62 @@ function AppProvider({children}){
     finally{ setLoading(false) }
   }
 
+  function scheduleRefresh(clientId){
+    if(refreshTimer.current) clearTimeout(refreshTimer.current)
+    refreshTimer.current=setTimeout(()=>silentAuth(clientId,false), 50*60*1000)
+  }
+
+  function silentAuth(clientId, loadAfter=true){
+    return new Promise(resolve=>{
+      function attempt(){
+        const client=window.google?.accounts?.oauth2?.initTokenClient({
+          client_id:clientId,
+          scope:'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email',
+          callback:async resp=>{
+            if(resp.error){
+              localStorage.removeItem('savedUser')
+              setUser(null); setAutoSigningIn(false)
+              resolve(false); return
+            }
+            setToken(resp.access_token)
+            setAutoSigningIn(false)
+            scheduleRefresh(clientId)
+            if(loadAfter){
+              const sid=JSON.parse(localStorage.getItem('appSettings')||'{}').spreadsheetId
+              if(sid) await loadData(sid)
+            }
+            resolve(true)
+          },
+          prompt:''
+        })
+        if(!client){ setTimeout(attempt,500); return }
+        client.requestAccessToken({prompt:''})
+      }
+      attempt()
+    })
+  }
+
+  useEffect(()=>{
+    const savedUser=user
+    const cid=settings.clientId
+    if(!savedUser||!cid||!settings.spreadsheetId) return
+    setAutoSigningIn(true)
+    silentAuth(cid, true)
+  },[])
+
   async function handleSignIn(tokenResp,userInfo){
-    setToken(tokenResp.access_token); setUser(userInfo)
+    setToken(tokenResp.access_token)
+    setUser(userInfo)
+    localStorage.setItem('savedUser',JSON.stringify(userInfo))
+    scheduleRefresh(settings.clientId)
     if(settings.spreadsheetId) await loadData(settings.spreadsheetId)
   }
-  function handleSignOut(){ setToken(null); setUser(null); setTasks([]); setNotes([]) }
+
+  function handleSignOut(){
+    setToken(null); setUser(null); setTasks([]); setNotes([])
+    localStorage.removeItem('savedUser')
+    if(refreshTimer.current) clearTimeout(refreshTimer.current)
+  }
 
   async function refreshData(){
     if(!settings.spreadsheetId) return
@@ -180,7 +233,7 @@ function AppProvider({children}){
     finally{ setSyncing(false) }
   }
 
-  return <Ctx.Provider value={{settings,saveSettings,user,tasks,setTasks,notes,setNotes,loading,syncing,error,handleSignIn,handleSignOut,refreshData,loadData}}>{children}</Ctx.Provider>
+  return <Ctx.Provider value={{settings,saveSettings,user,tasks,setTasks,notes,setNotes,loading,syncing,error,handleSignIn,handleSignOut,refreshData,loadData,autoSigningIn}}>{children}</Ctx.Provider>
 }
 
 // ─── Icons (inline SVG) ───────────────────────────────────────────────────────
@@ -1118,9 +1171,15 @@ function NotesTab(){
 
 // ─── App Shell ────────────────────────────────────────────────────────────────
 function Shell(){
-  const {user,syncing}=useApp()
+  const {user,syncing,autoSigningIn}=useApp()
   const [tab,setTab]=useState('tasks')
   const [showSettings,setShowSettings]=useState(false)
+  if(autoSigningIn) return <div className="flex flex-col items-center justify-center h-full bg-gradient-to-br from-blue-50 to-indigo-100 gap-4">
+    <div className="w-20 h-20 bg-indigo-500 rounded-3xl flex items-center justify-center shadow-lg">
+      <Ico k="task" size={40} className="text-white"/>
+    </div>
+    <p className="text-indigo-600 font-medium text-sm animate-pulse">Signing you in…</p>
+  </div>
   if(!user) return <LoginScreen/>
   return <div className="flex flex-col h-full bg-gray-50">
     <div className="flex items-center justify-between px-5 pt-12 pb-3 bg-white border-b border-gray-100">
